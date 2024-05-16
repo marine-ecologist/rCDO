@@ -1,0 +1,328 @@
+---
+title: "tidycdo"
+author: "George Roff"
+date: "2024-05-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+After spending a lot of time working with climate data in raster format in `R` and `python` across different libraries, I finally came across 'climate data operators' or '[CDO](https://code.mpimet.mpg.de/projects/cdo)'. CDO is "... a collection of command line Operators to manipulate and analyse Climate and NWP model Data", and can be run from a very wide range of operating systems (see [here](https://code.mpimet.mpg.de/projects/cdo/files) for more info). CDO for me wasn't the most intuitive language, but it has the benefit over `xarray` and `netCDF4` in that it can handle large datasets is *very* fast. There are a range of excellent interfaces through R to work with CDO (e.g. Mark Payne's [climateoperators](https://github.com/markpayneatwork/ClimateOperators) package), but it still wasn't intuitive (for me) when combining CDO operators: an example workflow of taking a `HADISST` .nc file:
+
+Input file -\> Select variable -\> Regrid to 0.5° -\> Set missing values to NaN -\> Write to output file
+
+looks like this:
+
+`cdo -L -O -select,name=sst -remapbil,global_0.5 -setmisstonn -select,name=sst -setmissval,nan Datasets/HadISST_sst.nc Outputs/HadISST_sst_regrided.nc`
+
+Which makes sense after a while of working with `CDO`, but to me still isn't intuitive.
+
+The `CDO` syntax gets even more complex to follow when running more complicated data, for example regridding and creating ensemble models from `CMIP6` data:
+
+```{r, eval=FALSE}
+# 1: create monthly regridded CMIP data (2015-2099)
+for(i in 1:nrow(merge_list)){
+ cdo("-L", "-O", csl("-select","name=tos"),"-setmisstonn", csl("-remapbil","global_0.5"), csl("-selyear",seq(2015,2099,by=1)), 
+   csl("-select","name=tos"),"-mergetime", 
+   paste0("Datasets/CMIP6/downloaded/", paste0(merge_list[i,],"*.nc")),
+   paste0("Datasets/CMIP6/downloaded/", paste0(merge_list[i,],"*.nc")), 
+   paste0("Datasets/CMIP6/cdo/",merge_list[i,],"_SST.nc"))
+
+    }
+
+# 2: create ensemble model (average of SSPs) from individual model runs
+ens <- c("119", "126", "245", "370", "585")
+for(i in 1:length(ens)){
+    cdo("ensmean", list.files(path="Datasets/CMIP6/cdo", pattern=ens[i], full.names=TRUE), paste0("Outputs/CMIP6/ensemble-SSTmonthly_ssp",ens[i],"_file_a.nc"), debug=FALSE)
+    cdo("-L", "-O", "-mul", "Outputs/HadISST/sp_dist_inverted.nc", paste0("Outputs/CMIP6/ensemble-SSTmonthly_ssp",ens[i],"_file_a.nc"), paste0("Outputs/CMIP6/ensemble-SSTmonthly_ssp",ens[i],"_file_b.nc")) 
+    cdo("-O", csl("-chname","sp_dist","sst"), paste0("Outputs/CMIP6/ensemble-SSTmonthly_ssp",ens[i],"_file_b.nc"), paste0("Outputs/CMIP6/ensemble-SSTmonthly_ssp",ens[i],"_file.nc")) 
+    file.remove(paste0("Outputs/CMIP6/ensemble-SSTmonthly_ssp",ens[i],"_file_a.nc"))
+    file.remove(paste0("Outputs/CMIP6/ensemble-SSTmonthly_ssp",ens[i],"_file_b.nc")) 
+    }
+
+```
+
+The structure of combining operators into a single CDO call to my mind is clearer when structured as using pipes with sequence of multiple operations in `R`. For example, the above would be structured as:
+
+```{r, eval=FALSE}         
+open file %>% 
+  select variable %>%
+  regrid to 0.5° %>% 
+  set missing values %>%
+  save file
+```
+
+`This`approach won't be intuitive to everyone, but as I've been using CDO to process a broad range of CMIP6 and satellite datasets I converted the funcitons into the 'tidyCDO\` package to make processing climate data more straight forwards.
+
+## tidycdo structure
+
+The `tidycdo` functions with three main functions as follows:
+
+```{r, eval=FALSE}
+readcdo(infile) %>%
+  operator() %>%
+  writecdo(outfile)
+```
+
+The `readcdo` and `writecdo` function as `infile` and `outfile` do with \``` cdo` `` and take `.nc` files (i.e. input and output).
+
+#### 1) read_cdo()
+
+```{r, eval=FALSE}
+# Function to initialize the command structure
+read_cdo <- function(...) {
+  infiles <- list(...)
+  list(command = "cdo", args = list(), infiles = infiles, outfile = NULL)
+}
+```
+
+#### 2) operator()
+
+```{r, eval=FALSE}
+
+# functions across different types of inputs, (e.g. numeric vectors, character vectors, 
+# and single numeric or character values
+
+operator <- function(cdo_command, op, params) {
+  # Ensure params are properly formatted
+  params_str <- if (is.character(params)) {
+    params
+  } else if (is.numeric(params) || is.vector(params)) {
+    paste(params, collapse = ",")
+  } else {
+    stop("Unsupported parameter type")
+  }
+
+  # Append the operator and params to the command
+  cdo_command$args <- append(cdo_command$args, paste0("-", op, ",", params_str))
+  return(cdo_command)
+}
+```
+
+#### 3) write_cdo()
+
+```{r, eval=FALSE}
+# Function to append an operator to the command
+write_cdo <- function(cdo_command, outfile) {
+  cdo_command$outfile <- outfile
+
+  # Construct the command string
+  args <- c(cdo_command$args, cdo_command$infile, cdo_command$outfile)
+
+  # Execute the command
+  result <- tryCatch({
+    output <- system2("cdo", args = args, stdout = TRUE, stderr = TRUE)
+    list(output = output, status = 0)
+  }, error = function(e) {
+    list(output = e$message, status = 1)
+  })
+
+  if (result$status != 0) {
+    stop(paste("Error in executing CDO command:", result$output))
+  }
+
+  return(result$output)
+}
+```
+
+
+to return the `CDO` command and not run the function, use `debug=TRUE`: 
+
+
+```{r, eval=FALSE}
+
+read_cdo(infile) %>%
+  operator("maskregion", myregion) %>%
+  write_cdo(outfile, debug=TRUE)
+
+```
+
+### Examples
+
+### Spatial subsetting with CDO
+
+#### i) global OISST dataset
+
+Read in dataset and plot with `stars`
+
+```{r, message=FALSE, warning=FALSE,, fig.width=9, fig.height=5}
+
+library(stars)
+library(tmap)
+library(magrittr)
+library(devtools)
+
+load_all()
+
+# Example usage
+myregion <- "/Users/rof011/rCDO/inst/exdata/GBRbounds.txt"
+infile <- "/Users/rof011/rCDO/inst/exdata/ncdc_oisst_v2_avhrr_prelim_by_time_zlev_lat_lon_25c1_e82d_d183.nc"
+outfile <- "/Users/rof011/rCDO/inst/exdata/tmp.nc"
+
+#plot
+map <- read_ncdf(infile)  
+tm_shape(map) + tm_raster(col.scale = tm_scale_continuous(values="-rd_bu", midpoint=20))
+
+```
+
+#### ii) maskregion
+
+Using a mask for the Great Barrier Reef Region in the points format of `CDO`
+
+```{r, message=FALSE, warning=FALSE,}
+# read points mask
+head(read.table(myregion))
+
+# run rCDO
+read_cdo(infile) %>%
+  operator("maskregion", myregion) %>%
+  write_cdo(outfile)
+
+#plot
+map <- read_ncdf(outfile)  
+tm_shape(map) + tm_raster(col.scale = tm_scale_continuous(values="-rd_bu", midpoint=26))
+
+```
+
+#### iii) sellonlatbox
+
+crop to a boundary box using `CDO` `sellonlatbox`
+
+```{r, message=FALSE, warning=FALSE,}
+
+# boundary box in the format of xmin, xmax, ymin, ymax
+boundarybox <- c(142.53, 154, -24.49, -10.68)
+
+# run rCDO
+read_cdo(infile) %>%
+  operator("sellonlatbox", boundarybox) %>%
+  write_cdo(outfile)
+
+# plot
+map <- read_ncdf(outfile)  
+tm_shape(map) + 
+  tm_raster(col.scale = tm_scale_continuous(values="-rd_bu", midpoint=26))
+
+
+```
+
+#### iv) combined functions
+
+Now combine the two functions to first mask then crop to the region:
+
+```{r, warning=FALSE, messqge=FALSE}
+
+# boundary box in the format of xmin, xmax, ymin, ymax
+boundarybox <- c(142.53, 154, -24.49, -10.68)
+
+# run rCDO
+read_cdo(infile) %>%
+  operator("maskregion", myregion) %>%
+  operator("sellonlatbox", boundarybox) %>%
+  write_cdo(outfile)
+
+# plot
+ausmap <- rnaturalearth::ne_countries(country="Australia", scale="large") # load map
+
+map <- read_ncdf(outfile)  
+
+tm_shape(map, is.master=TRUE) + 
+  tm_raster(col.scale = tm_scale_continuous(values="-rd_bu", midpoint=26)) +
+tm_shape(ausmap) +
+  tm_polygons()
+```
+
+#### v) Regridding with CDO
+
+continuing from the previous example, let's say we want to downsample and regrid OISST to match 1° gridcells. We can pipe operators as follows:
+
+mask \> crop \> regrid
+
+```{r, warning=FALSE, message=FALSE}
+
+
+read_cdo(infile) %>%
+  operator("maskregion", myregion) %>%
+  operator("sellonlatbox", boundarybox) %>%
+  operator("remapbil", "global_1") %>%
+  write_cdo(outfile)
+
+map <- read_ncdf(outfile)  
+
+tm_shape(map, is.master=TRUE) + 
+  tm_raster(col.scale = tm_scale_continuous(values="-rd_bu", midpoint=26)) +
+tm_shape(ausmap) +
+  tm_polygons()
+
+```
+
+
+
+
+### Temporal subsetting with CDO
+
+
+#### i) global OISST timeseries
+
+Read in dataset with `stars` and plot timeseries with 'ggplot'
+
+```{r, message=FALSE, warning=FALSE, fig.width=9, fig.height=5}
+
+library(ggplot2)
+
+# Example usage
+infile <- "/Users/rof011/rCDO/inst/exdata/ncdc_oisst_v2_avhrr_by_time_zlev_lat_lon_b25f_64c0_90ed.nc"
+outfile <- "/Users/rof011/rCDO/inst/exdata/tmp.nc"
+
+#plot
+timeseries <- read_ncdf(infile) |> as.data.frame()  
+
+ggplot() + theme_bw() +
+  geom_line(data=timeseries, aes(x=time, y=as.numeric(sst)))
+
+```
+
+#### i) ymonavg
+
+compute statistical values of each month of year with stdev
+
+```{r, message=FALSE, warning=FALSE, fig.width=9, fig.height=5}
+library(dplyr)
+
+# OISST input
+infile <- "/Users/rof011/rCDO/inst/exdata/ncdc_oisst_v2_avhrr_by_time_zlev_lat_lon_b25f_64c0_90ed.nc"
+# set output files
+mean <- "/Users/rof011/rCDO/inst/exdata/tmp_mean.nc"
+stdev <- "/Users/rof011/rCDO/inst/exdata/tmp_stdev.nc"
+
+# get monthly mean
+read_cdo(infile) %>%
+  operator("ymonmean") %>%
+  write_cdo(mean)
+
+# get monthly stdev
+read_cdo(infile) %>%
+  operator("ymonstd") %>%
+  write_cdo(stdev)
+
+
+monthly_mean <- read_ncdf(mean) |> as.data.frame() |> rename(mean=sst)
+monthly_stdev <- read_ncdf(stdev) |> as.data.frame() |> rename(std=sst)  
+
+monthly <- left_join(monthly_mean, monthly_stdev)
+
+
+ggplot() + theme_bw() +
+  geom_errorbar(data=monthly, aes(x=as.Date(time), 
+                                       ymin=as.numeric(mean)-as.numeric(std),
+                                       ymax=as.numeric(mean)+as.numeric(std)), width=0) +
+  geom_point(data=monthly, aes(x=as.Date(time), y=as.numeric(mean), fill=as.numeric(mean)), 
+             size=3, shape=21, show.legend=FALSE) +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") + xlab("") + ylab("Mean SST") +
+  scale_fill_distiller(palette="RdBu")
+    
+
+
+```
