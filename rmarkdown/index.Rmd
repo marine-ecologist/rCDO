@@ -1,6 +1,6 @@
 ---
-title: "tidycdo"
-author: "George Roff"
+title: "library(rCDO) 0.9000 - an R interface for Climate Data Operators"
+author: "George Roff (george.roff@csiro.au)"
 date: "2024-05-16"
 output: html_document
 ---
